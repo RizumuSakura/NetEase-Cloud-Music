@@ -2,8 +2,17 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.5.3
+ * @version 1.6.0
  * @license MIT
+ * 
+ * @changelog v1.6.0
+ *  - 新增「自动取消红心」：为完成任务而点的红心会被记录到状态文件，
+ *    待服务端把该任务标记为完成后的下一次运行自动取消（只取消脚本自己点的，
+ *    不会动你手动收藏的歌曲）；任务未完成时不会取消
+ *  - 查看/分享类任务上报前先 GET 打开其 H5 跳转页（带 Cookie + webview UA），
+ *    更贴近真实流程（打开页面 → 停留 → 页面上报）
+ *  - missionDTO / schemaContent 全文输出改为由 NCM_TASKS_DEBUG=1 控制，默认不再刷屏
+ *  - 云贝收支记录的合计文案修正（接口不受 limit 限制，会返回全部记录）
  * 
  * @changelog v1.5.3（依据 2026-09-26 真机日志修正）
  *  - 【关键】页面浏览上报参数修正：实测网易云用的是带前缀的参数名——
@@ -109,6 +118,9 @@ const TASK_SWITCH = (process.env.NCM_TASKS || '')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 const taskEnabled = (name) => TASK_SWITCH.includes(name);
+
+// 任务模块调试输出（完整 missionDTO / schemaContent）：NCM_TASKS_DEBUG=1
+const TASKS_DEBUG = process.env.NCM_TASKS_DEBUG === '1';
 
 // ================= 状态文件（deviceId / xeapi 公钥持久化） =================
 
@@ -801,18 +813,19 @@ function pickTaskSongs(songs, count) {
     };
 }
 
-// 红心歌曲
+// 红心 / 取消红心
 // 首选 weapi 的 radio/like（经典接口，不需要易盾 token）；
 // 失败时回退 eapi song/like 并携带易盾 token v3（实测不带 token 会返回 524 环境异常）
-async function likeSong(trackId) {
+async function likeSong(trackId, like = true) {
+    const label = like ? '红心' : '取消红心';
     const weapiRes = await withRetry(
         () => weapiRequest('/weapi/radio/like', {
             alg: 'itembased',
             trackId: String(trackId),
-            like: true,
+            like,
             time: '3',
         }),
-        '红心(weapi)'
+        `${label}(weapi)`
     );
     if (weapiRes.code === 200) return weapiRes;
 
@@ -821,12 +834,48 @@ async function likeSong(trackId) {
     return await withRetry(
         () => eapiRequest('/api/song/like', {
             trackId: String(trackId),
-            like: 'true',
+            like: like ? 'true' : 'false',
             time: '3',
             checkToken: token || '',
         }, { hostname: 'interface3.music.163.com' }),
-        '红心(eapi)'
+        `${label}(eapi)`
     );
+}
+
+// 会员任务状态表：{ 任务名: missionStatus }（100 = 已完成）
+async function getVipMissionStatusMap(userId) {
+    const res = await vipMissionProgressWeapi(userId);
+    const list = Array.isArray(res?.data) ? res.data : [];
+    const map = {};
+    for (const m of list) {
+        const name = m?.basicMissionDTO?.name;
+        if (name) map[name] = Number(m.missionStatus);
+    }
+    return { map, list, code: res.code };
+}
+
+// 打开 H5 页面（模拟 webview 访问，带 Cookie）——部分"查看类"任务需要先有页面访问
+async function openH5Page(url) {
+    if (!url || typeof url !== 'string') return { status: -1, message: '无链接' };
+    let u;
+    try {
+        u = new URL(url);
+    } catch (e) {
+        return { status: -1, message: '链接非法' };
+    }
+    if (u.protocol !== 'https:') return { status: -1, message: `跳过非 https 链接 (${u.protocol})` };
+    return await rawRequest({
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers: {
+            'Cookie': buildCookie({ os: 'pc', appver: '3.1.17.204416' }),
+            'User-Agent': WEBVIEW_UA,
+            'Referer': 'https://music.163.com/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        timeout: 15000,
+    });
 }
 
 // 分享单曲（多通道尝试：xeapi → eapi note 路径；实测单通道可能返回 250）
@@ -947,6 +996,8 @@ function parseJumpUrlParams(jumpUrl) {
 }
 
 // 中台页面浏览上报（模拟 App 内 webview，用 iPhone webview UA）
+const WEBVIEW_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 CloudMusic/0.1.1 NeteaseMusic/9.4.95';
+
 async function middlePageViewReport(fields) {
     const data = {
         actionType: fields.actionType || 'view',
@@ -963,7 +1014,7 @@ async function middlePageViewReport(fields) {
     return await withRetryStrict(
         () => weapiRequest('/weapi/middle/page/view/report', { data: JSON.stringify(data) }, {
             hostname: 'interface.music.163.com',
-            ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 CloudMusic/0.1.1 NeteaseMusic/9.4.95',
+            ua: WEBVIEW_UA,
         }),
         '页面浏览上报'
     );
@@ -1034,25 +1085,80 @@ async function runDailyTasks(userId) {
     }
 
     // 1) 红心 3 首 VIP 单曲
+    // 为了完成任务而点的红心，会在任务被服务端标记为完成后自动取消（只取消脚本自己点的）
     if (taskEnabled('like')) {
         console.log('   ❤️ 红心歌曲...');
-        if (!picked.length) {
+        const pending = Array.isArray(state.pendingUnlike) ? state.pendingUnlike : [];
+
+        // 查询会员任务状态，判断"红心N首会员单曲"是否已完成
+        let likeTaskDone = false;
+        let likeTaskName = '';
+        try {
+            const st = await getVipMissionStatusMap(userId);
+            for (const [name, status] of Object.entries(st.map)) {
+                if (/红心/.test(name)) {
+                    likeTaskName = name;
+                    likeTaskDone = status === 100;
+                    break;
+                }
+            }
+            if (likeTaskName) {
+                console.log(`      ℹ️ 任务「${likeTaskName}」状态：${likeTaskDone ? '已完成' : '未完成'}`);
+            } else {
+                console.log(`      ℹ️ 未找到红心类任务（code=${st.code}），按未完成处理`);
+            }
+        } catch (e) {
+            console.log(`      ⚠️ 查询任务状态失败：${e.message}`);
+        }
+
+        // 1a) 任务已完成 → 取消之前为完成任务而点的红心
+        if (likeTaskDone && pending.length) {
+            console.log(`      🔄 任务已完成，取消上次为完成任务点的 ${pending.length} 首红心`);
+            let undone = 0;
+            for (const item of pending) {
+                const r = await likeSong(item.id, false);
+                if (r.code === 200) {
+                    undone++;
+                    console.log(`      ↩️ 已取消红心：${item.name || item.id}`);
+                } else {
+                    console.log(`      ⚠️ 取消红心失败 ${item.name || item.id} code=${r.code}${r.msg ? '：' + r.msg : ''}`);
+                }
+            }
+            state.pendingUnlike = [];
+            saveState();
+            if (undone) summary.push(`↩️ 取消红心×${undone}`);
+        } else if (!likeTaskDone && pending.length) {
+            console.log(`      ℹ️ 任务尚未标记完成，暂不取消（共 ${pending.length} 首待取消）`);
+        }
+
+        // 1b) 任务未完成 → 点红心
+        if (likeTaskDone) {
+            console.log('      ℹ️ 红心任务今日已完成，跳过点赞');
+        } else if (!picked.length) {
             console.log('      ⚠️ 没有可用歌曲（每日推荐为空），跳过');
         } else {
             let ok = 0;
             let likedPlaylistId = '';
+            const newlyLiked = [];
             for (const s of picked) {
-                const r = await likeSong(s.id);
+                const r = await likeSong(s.id, true);
                 if (r.code === 200) {
                     ok++;
                     if (r.playlistId) likedPlaylistId = r.playlistId;
+                    newlyLiked.push({ id: s.id, name: s.name });
                     console.log(`      ✅ ${s.name}${s.fee === 1 ? ' (VIP)' : ''}`);
                 } else {
-                    console.log(`      ⚠️ ${s.name} 失败 code=${r.code}${r.msg ? ', ' + r.msg : ''}`);
+                    console.log(`      ⚠️ ${s.name} 失败 code=${r.code}${r.msg ? '：' + r.msg : ''}`);
                 }
             }
             if (likedPlaylistId) {
                 console.log(`      ℹ️ 我喜欢的音乐 playlistId=${likedPlaylistId}`);
+            }
+            if (newlyLiked.length) {
+                // 记录下来，等任务被标记完成后自动取消
+                state.pendingUnlike = newlyLiked;
+                saveState();
+                console.log(`      ℹ️ 已记录 ${newlyLiked.length} 首待取消（任务完成后会自动取消红心）`);
             }
             summary.push(`❤️ 红心×${ok}`);
         }
@@ -1235,8 +1341,17 @@ async function runDailyTasks(userId) {
                     };
                     console.log(`      ℹ️ [${t.name}] 上报参数：${JSON.stringify({ ...fields, jumpUrl: fields.jumpUrl ? '(略)' : '' })}`);
                     console.log(`      ℹ️ [${t.name}] actionType=${t.dto.actionType ?? '-'} missionEntityId=${t.dto.missionEntityId ?? '-'}`);
-                    console.log(`      ℹ️ [${t.name}] missionDTO 全文：${JSON.stringify(t.dto)}`);
-                    console.log(`      ℹ️ [${t.name}] schemaContent 全文：${JSON.stringify(t.schema)}`);
+                    if (TASKS_DEBUG) {
+                        console.log(`      ℹ️ [${t.name}] missionDTO 全文：${JSON.stringify(t.dto)}`);
+                        console.log(`      ℹ️ [${t.name}] schemaContent 全文：${JSON.stringify(t.schema)}`);
+                    }
+                    // 真实流程是「打开 H5 页面 → 停留 view_time 秒 → 页面自己上报」，
+                    // 所以这里先 GET 打开页面，再发上报
+                    if (fields.jumpUrl) {
+                        const page = await openH5Page(fields.jumpUrl);
+                        const bodyLen = page?.data ? page.data.length : 0;
+                        console.log(`      ℹ️ [${t.name}] 打开跳转页 HTTP ${page?.status ?? '-'}（${bodyLen} 字节）${page?.message ? ' ' + page.message : ''}`);
+                    }
                     try {
                         const r = await middlePageViewReport(fields);
                         console.log(`      ${r.code === 200 ? '✅' : '⚠️'} [${t.name}] 上报 code=${r.code} data=${JSON.stringify(r.data ?? null)}${r.msg ? ' msg=' + r.msg : ''}`);
@@ -1282,7 +1397,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.5.3)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.0)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
@@ -1478,7 +1593,7 @@ async function main() {
                 console.log(`      · +${point} ${desc} ${time}`);
             }
             const total = list.reduce((sum, r) => sum + Number(r.pointCost ?? r.point ?? 0), 0);
-            if (total > 0) console.log(`      ℹ️ 以上 ${list.length} 条合计 +${total} 云贝`);
+            if (total > 0) console.log(`      ℹ️ 接口共返回 ${list.length} 条，合计 +${total} 云贝`);
         } else if (rec.code === 200) {
             console.log('   ℹ️ 云贝收支记录为空');
         } else {

@@ -228,6 +228,7 @@ MUSIC_U 过期了。重新走第二节的步骤获取，然后更新青龙里的
 |---|---|---|
 | `NETEASE_MUSIC_U` | ✅ | 登录凭证，支持 `MUSIC_U=xxx; __csrf=yyy` 或纯 `MUSIC_U` 值 |
 | `NCM_TASKS` | ❌ | 开启每日任务自动化，逗号分隔：`like`/`share`/`browse`/`welfare`/`view`/`listen`。**默认不设 = 全部关闭**，详见第十一节 |
+| `NCM_TASKS_DEBUG` | ❌ | 设为 `1` 输出完整的 `missionDTO` / `schemaContent`（排查任务字段时用，平时不要开） |
 | `NCM_NO_DELAY` | ❌ | 设为 `1` 关闭请求间随机延时（仅调试用） |
 
 ---
@@ -274,7 +275,7 @@ NCM_TASKS=like,share,browse,welfare,view      # 逗号分隔，任选组合
 
 | 开关 | 对应 App 里的任务 | 脚本实际做的事 | 用到的接口 |
 |---|---|---|---|
-| `like` | 红心3首VIP单曲（+3成长值） | 从你的每日推荐里挑 3 首 **VIP 单曲**（`fee=1`）点红心；不足 3 首时回退用普通歌曲 | `eapi/song/like`（interface3） |
+| `like` | 红心3首VIP单曲（+3成长值） | 从你的每日推荐里挑 3 首 **VIP 单曲**（`fee=1`）点红心；**任务被标记完成后的下一次运行会自动取消这些红心**（见下方说明） | `eapi/song/like` / `weapi/radio/like` |
 | `share` | 分享单曲到站外（+2成长值） | 把第 1 首挑中的单曲分享到动态 | `xeapi/share/friends/resource` |
 | `welfare` | 免费领福利（+2成长值） | 拉取会员尊享福利列表 → 逐个领取**免费**福利（`specialPrice>0` 的付费福利自动跳过） | `weapi/vipnewcenter/app/level/welfare/new/list` + `welfare/claim` |
 | `view` | **查看AI调音大师（+2成长值）**等查看类任务 | 读会员成长任务列表 → 解析任务的 `schemaContent` 拿到 `jumpUrl` → 从中提取 `taskId/taskType/taskBusiness/resourceType/pageCode` → 上报浏览时长（15 秒）→ 复查 | `weapi/middle/vip/mission/user/progress/list` + `weapi/middle/page/view/report` |
@@ -282,6 +283,28 @@ NCM_TASKS=like,share,browse,welfare,view      # 逗号分隔，任选组合
 | `listen` | 每日听3首VIP歌曲（+3成长值） | 上报 3 首 VIP 单曲的播放（startplay + play 两次上报） | `eapi/feedback/weblog`（clientlog 域名） |
 
 > 说明：`view` 和 `browse` 分别对应**会员侧**和**云贝侧**的"查看/浏览"任务，两套任务体系不同、接口也不同，所以拆成两个开关。
+
+### 关于「红心」的自动取消（重要）
+
+脚本只为了**完成任务**才点红心，并不代表你真的喜欢那几首歌。所以它做了这两步：
+
+1. **点红心时**：把点过的歌曲 id 记到状态文件 `.netease-checkin-state.json` 的 `pendingUnlike` 字段
+2. **下一次运行时**：先查会员任务状态，如果「红心N首会员单曲」已变成**已完成**，就自动把这批红心**取消**，并清空记录
+
+日志表现：
+
+```
+❤️ 红心歌曲...
+   ℹ️ 任务「红心3首会员单曲」状态：已完成
+   🔄 任务已完成，取消上次为完成任务点的 3 首红心
+   ↩️ 已取消红心：xxx
+   ℹ️ 红心任务今日已完成，跳过点赞
+```
+
+两个安全保证：
+
+- **只取消脚本自己点的**（靠 `pendingUnlike` 记录），你手动收藏的歌曲不会被碰
+- **任务没完成就不会取消**，避免白点一次；如果某天任务状态异常，日志会提示 `任务尚未标记完成，暂不取消`
 
 ### 风险等级（重要）
 
