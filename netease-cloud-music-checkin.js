@@ -2,8 +2,20 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.5
+ * @version 1.6.6
  * @license MIT
+ * 
+ * @changelog v1.6.6（按实测结论收敛，不再误导）
+ *  - 加入实测结论标注：
+ *    ✅ like    真正有效（红心后服务端把任务标记完成，+3成长值，随后自动取消红心）
+ *    ❌ view    无效（H5 的 view/report 只是埋点，H5 上报后回调 RN 宿主，
+ *               真正完成任务在 App 原生侧；脚本已完整复刻 H5 流程仍无效）
+ *    ⚠️ share   三个上报通道均返回 200 但任务状态不变
+ *    ⚠️ welfare 领取端点已失效（404）
+ *    ⚠️ browse  该账号云贝任务里无浏览类任务（空转）
+ *  - 推荐配置改为 NCM_TASKS=like,share,welfare,browse（去掉无效的 view）
+ *  - 开启 view 时明确打印"实测无效"提示；view 相关代码保留作诊断用途
+ *  - TUTORIAL 第十一节全面按实测结论重写（有效性表格 + 推荐用法）
  * 
  * @changelog v1.6.5（按 H5 页面的真实路径改为明文上报，并新增分享页面上报）
  *  - 【关键】中台页面上报改用**明文 api 路径**（与 H5 页面完全一致）：
@@ -159,13 +171,15 @@ const csrfToken = csrfMatch ? csrfMatch[1] : '';
 // 是否跳过随机延时（调试用）：NCM_NO_DELAY=1
 const NO_DELAY = process.env.NCM_NO_DELAY === '1';
 
-// 每日任务自动化开关（实验性）：NCM_TASKS=like,share,browse,welfare,view
-//   like    = 红心 3 首 VIP 单曲
-//   share   = 分享 1 首单曲到动态
-//   browse  = 浏览类任务上报（云贝任务中心 click/task）
-//   welfare = 领取会员尊享福利（免费领福利）
-//   view    = 查看类会员任务上报（查看AI调音大师等，页面浏览时长上报）
-//   listen  = 听 3 首 VIP 歌曲上报播放（⚠️ 刷歌行为，风控高发，谨慎开启）
+// 每日任务自动化开关（实验性）
+// 推荐配置：NCM_TASKS=like,share,welfare,browse
+//   like    = 红心 3 首 VIP 单曲            ✅ 实测有效：任务会被服务端计入完成（+3成长值），
+//                                             任务完成后本脚本会自动取消这批红心
+//   welfare = 领取会员尊享福利              ⚠️ 实测领取端点已失效（404），实际领不到
+//   browse  = 云贝任务中心的浏览类任务上报   ⚠️ 依账号而定：本账号任务里无"浏览"类，属空转（无害）
+//   share   = 分享单曲并上报                ⚠️ 上报接口均返回 200，但实测未计入任务完成
+//   view    = 查看类会员任务上报            ❌ 实测无效：H5 上报只是埋点，真正完成任务在 App 原生侧
+//   listen  = 听 3 首 VIP 歌曲上报播放       ⚠️ 刷歌行为，风控高发，谨慎开启
 // 留空 = 全部不执行（默认）
 const TASK_SWITCH = (process.env.NCM_TASKS || '')
     .split(',')
@@ -1364,6 +1378,7 @@ async function runDailyTasks(userId) {
     // 2) 分享单曲
     if (taskEnabled('share')) {
         console.log('   🔗 分享单曲...');
+        console.log('      ℹ️ 实测提示：分享接口均返回 200，但未计入任务完成（分享任务需 App 原生侧动作）');
         if (!picked.length) {
             console.log('      ⚠️ 没有可用歌曲，跳过');
         } else {
@@ -1511,9 +1526,16 @@ async function runDailyTasks(userId) {
         }
     }
 
-    // 5) 查看类会员任务（查看AI调音大师等：页面浏览时长上报）
+    // 5) 查看类会员任务
+    // ⚠️ 实测结论（2026-09-26，多轮验证）：H5 的 /api/middle/page/view/report 只是埋点。
+    //    H5 上报后会 callback 给 RN 宿主（JS: .then(t => w(!!t))），真正的"任务完成"
+    //    由 App 原生侧触发。所以本开关把流程走得完全正确（页面打开 → /api/batch 初始化 →
+    //    停留 view_time 秒 → viewEnd 上报，全部 200），任务状态仍然不会变。
+    //    保留此代码仅作诊断/未来接口变化时复用，实际请直接在 App 里点一下"去完成"。
     if (taskEnabled('view')) {
         console.log('   🔍 会员查看类任务...');
+        console.log('      ⚠️ 实测无效：H5 的 view/report 只是埋点，真正完成任务在 App 原生侧');
+        console.log('         （本开关会额外等待约 15 秒，建议改用 App 手动完成，脚本会自动领奖）');
         try {
             let res = await vipMissionProgressWeapi(userId);
             let missions = Array.isArray(res?.data) ? res.data : null;
@@ -1562,7 +1584,7 @@ async function runDailyTasks(userId) {
                         activityPlatformId: fromUrl.activityPlatformId,
                     };
                     console.log(`      ℹ️ [${t.name}] 上报参数：${JSON.stringify({ ...fields, jumpUrl: fields.jumpUrl ? '(略)' : '' })}`);
-                    console.log(`      ℹ️ [${t.name}] actionType=${t.dto.actionType ?? '-'} missionEntityId=${t.dto.missionEntityId ?? '-'}`);
+                    console.log(`      ℹ️ [${t.name}] 任务DTO.actionType=${t.dto.actionType ?? '-'}（上报实际使用 viewEnd） missionEntityId=${t.dto.missionEntityId ?? '-'}`);
                     if (TASKS_DEBUG) {
                         console.log(`      ℹ️ [${t.name}] missionDTO 全文：${JSON.stringify(t.dto)}`);
                         console.log(`      ℹ️ [${t.name}] schemaContent 全文：${JSON.stringify(t.schema)}`);
@@ -1649,7 +1671,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.5)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.6)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
