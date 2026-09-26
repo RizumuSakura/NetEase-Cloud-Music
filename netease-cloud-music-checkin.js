@@ -2,8 +2,19 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.5.2
+ * @version 1.5.3
  * @license MIT
+ * 
+ * @changelog v1.5.3（依据 2026-09-26 真机日志修正）
+ *  - 【关键】页面浏览上报参数修正：实测网易云用的是带前缀的参数名——
+ *    jumpUrl 里的 view_task_id / view_task_business / view_time 才对应上报的
+ *    taskId / taskBusiness / viewTime；actionType 取自任务的 actionType 字段
+ *    （如 vip_growth_view_activity_page）。原来硬编码 actionType='view' 且不认这些
+ *    前缀名，导致上报虽返回 200 但不被计入任务完成
+ *  - 浏览上报的目标任务扩展为 查看|浏览|体验|逛逛|分享（分享类任务的 H5 同样带 view_task_*）
+ *  - 云贝余额改回权威接口 /weapi/v1/user/info 的 data.userPoint.balance（ncmctl YunBeiUserInfo），
+ *    middle/mall/balance 降为备用并逐个打印返回，便于对照
+ *  - 云贝收支记录字段修正为 pointCost（原来找 point 导致显示 +?），并输出合计
  * 
  * @changelog v1.5.2（追加诊断输出，用于定位剩余三个未解决问题）
  *  - 新增云贝收支记录查询（/store/api/point/receipt），核对任务奖励是否真的到账
@@ -642,14 +653,23 @@ async function yunbeiTaskFinish(task) {
     return await withRetry(() => weapiRequest('/weapi/usertool/task/point/receive', data), '云贝任务领取');
 }
 
-// 云贝余额（官方：interface.music.163.com 的 middle/mall/balance → { balance, blockBalance }）
+// 云贝余额
+// 权威来源（ncmctl YunBeiUserInfo）：music.163.com/weapi/v1/user/info → data.userPoint.balance
+// 备用：interface.music.163.com/weapi/middle/mall/balance → data.balance
+// （实测备用接口的池子可能为 0，与收支记录里的 +1100 矛盾，故降为备用）
 async function getYunbeiInfo() {
-    const res = await withRetry(
-        () => weapiRequest('/weapi/middle/mall/balance', {}, { hostname: 'interface.music.163.com' }),
-        '云贝余额'
-    );
-    if (res.code === 200 && res.data) return res;
-    return await withRetry(() => weapiRequest('/weapi/v1/user/info', {}), '云贝余额(备用)');
+    const attempts = [
+        ['/weapi/v1/user/info', {}],
+        ['/weapi/middle/mall/balance', { hostname: 'interface.music.163.com' }],
+    ];
+    let last = { code: -1, message: '未尝试' };
+    for (const [path, extra] of attempts) {
+        const r = await withRetry(() => weapiRequest(path, {}, extra), `云贝余额(${path})`);
+        if (r.code === 200 && parseYunbeiBalance(r) !== null) return r;
+        console.log(`   ℹ️ 余额接口 ${path} 返回 code=${r.code}${r.data ? ' data=' + JSON.stringify(r.data).slice(0, 120) : ''}`);
+        last = r;
+    }
+    return last;
 }
 
 // 黑胶乐签打卡详情（eapi，官方预检查口径）
@@ -897,6 +917,8 @@ function parseSchemaContent(schemaContent) {
 }
 
 // 从 jumpUrl 的查询串里提取上报所需字段
+// 实测（2026-09-26）网易云用的是带前缀的名字：
+//   ?nm_style=sbt&view_task_id=16212254&view_task_business=music.vip_growth&view_time=15
 function parseJumpUrlParams(jumpUrl) {
     const out = {};
     if (!jumpUrl || typeof jumpUrl !== 'string') return out;
@@ -904,10 +926,22 @@ function parseJumpUrlParams(jumpUrl) {
     if (q < 0) return out;
     try {
         const sp = new URLSearchParams(jumpUrl.slice(q + 1));
-        for (const k of ['taskId', 'taskType', 'taskBusiness', 'resourceType', 'pageCode', 'activityPlatformId', 'viewTime']) {
-            const v = sp.get(k);
-            if (v) out[k] = v;
+        const map = {
+            taskId: ['view_task_id', 'taskId'],
+            taskType: ['view_task_type', 'taskType'],
+            taskBusiness: ['view_task_business', 'taskBusiness'],
+            resourceType: ['view_resource_type', 'resourceType'],
+            pageCode: ['view_page_code', 'pageCode'],
+            activityPlatformId: ['activityPlatformId'],
+        };
+        for (const [key, names] of Object.entries(map)) {
+            for (const n of names) {
+                const v = sp.get(n);
+                if (v) { out[key] = v; break; }
+            }
         }
+        const vt = sp.get('view_time') || sp.get('viewTime');
+        if (vt) out.viewTimeSec = Number(vt);
     } catch (e) { /* 忽略解析失败 */ }
     return out;
 }
@@ -1177,8 +1211,8 @@ async function runDailyTasks(userId) {
                     if (status === 100) completedCount++;
                     console.log(`         · [${doneText}] ${name} missionCode=${dto.missionCode ?? '-'} taskId=${dto.missionId ?? '-'} 成长值+${dto.alue ?? '-'}`);
                     if (status === 100) continue;
-                    // 查看/浏览类 → 页面浏览上报；分享类的页面上报由 share 开关触发（见下）
-                    if (/查看|浏览|体验|逛逛/.test(name)) targets.push({ name, dto, schema, jumpUrl });
+                    // 查看/浏览类 → 页面浏览上报；分享类也一并上报（其 H5 同样带 view_task_* 参数）
+                    if (/查看|浏览|体验|逛逛|分享/.test(name)) targets.push({ name, dto, schema, jumpUrl });
                 }
                 console.log(`      ℹ️ 会员任务：已完成 ${completedCount}/${missions.length} 项`);
                 if (!targets.length) {
@@ -1187,10 +1221,12 @@ async function runDailyTasks(userId) {
                 for (const t of targets) {
                     const fromUrl = parseJumpUrlParams(t.jumpUrl);
                     const fields = {
-                        actionType: 'view',
+                        // 实测：动作类型来自任务的 actionType 字段（如 vip_growth_view_activity_page）
+                        actionType: t.dto.actionType || 'vip_growth_view_activity_page',
                         taskId: fromUrl.taskId || t.dto.missionId || '',
                         taskType: fromUrl.taskType || t.dto.missionType || 0,
-                        viewTime: 15000,
+                        // view_time=15 是秒，上报字段按毫秒传
+                        viewTime: fromUrl.viewTimeSec ? fromUrl.viewTimeSec * 1000 : 15000,
                         jumpUrl: t.jumpUrl,
                         taskBusiness: fromUrl.taskBusiness || '',
                         resourceType: fromUrl.resourceType || '',
@@ -1198,6 +1234,7 @@ async function runDailyTasks(userId) {
                         activityPlatformId: fromUrl.activityPlatformId,
                     };
                     console.log(`      ℹ️ [${t.name}] 上报参数：${JSON.stringify({ ...fields, jumpUrl: fields.jumpUrl ? '(略)' : '' })}`);
+                    console.log(`      ℹ️ [${t.name}] actionType=${t.dto.actionType ?? '-'} missionEntityId=${t.dto.missionEntityId ?? '-'}`);
                     console.log(`      ℹ️ [${t.name}] missionDTO 全文：${JSON.stringify(t.dto)}`);
                     console.log(`      ℹ️ [${t.name}] schemaContent 全文：${JSON.stringify(t.schema)}`);
                     try {
@@ -1245,7 +1282,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.5.2)');
+    console.log('🎵 网易云音乐自动签到 (v1.5.3)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
@@ -1434,13 +1471,14 @@ async function main() {
         if (list.length) {
             console.log('   📜 最近云贝收支：');
             for (const r of list.slice(0, 5)) {
-                const point = r.point ?? r.pointAdd ?? r.pointNum ?? r.amount ?? '?';
+                // 实测字段名是 pointCost（不是 point）
+                const point = r.pointCost ?? r.point ?? r.pointAdd ?? r.pointNum ?? r.amount ?? '?';
                 const desc = [r.fixed, r.variable].filter(Boolean).join('') || r.typeName || r.description || '';
-                const time = r.time || r.createTime;
-                const timeText = time ? new Date(Number(time)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '';
-                console.log(`      · +${point} ${desc} ${timeText}`);
-                console.log(`        ${JSON.stringify(r).slice(0, 200)}`);
+                const time = r.date || r.time || r.createTime || '';
+                console.log(`      · +${point} ${desc} ${time}`);
             }
+            const total = list.reduce((sum, r) => sum + Number(r.pointCost ?? r.point ?? 0), 0);
+            if (total > 0) console.log(`      ℹ️ 以上 ${list.length} 条合计 +${total} 云贝`);
         } else if (rec.code === 200) {
             console.log('   ℹ️ 云贝收支记录为空');
         } else {
