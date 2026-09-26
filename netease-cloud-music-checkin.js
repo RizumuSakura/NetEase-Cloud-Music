@@ -2,8 +2,32 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.5.0
+ * @version 1.5.1
  * @license MIT
+ * 
+ * @changelog v1.5.1（首次真机实测后修正，含任务模块）
+ *  【云贝链路】
+ *  - 云贝签到判定修正：/pointmall/user/sign 返回 data.sign=true 才是签到成功，
+ *    false 表示重复签到（原代码把两者都当成成功，日志会误报"签到成功"）
+ *  - "今日是否已签到"改用 /point/today/get 的 data.shells（今天已获得的云贝数），
+ *    原来的 isSign/signed/status 字段在该接口里根本不存在，导致每次都重复请求签到
+ *  - 云贝余额改用官方接口 middle/mall/balance（interface.music.163.com），
+ *    原 /v1/user/info 与 /pointmall/user/info 均已 404
+ *  - 连签进度改用 /pointmall/user/sign/config（原 /sign/progress 已 404）
+ *  - 连签奖励领取改用 /pointmall/user/sign/lottery/get（interface.music.163.com），
+ *    且判定条件修正为 baseLotteryId > 0（原用 baseLotteryStatus === 1 判断，
+ *    而该字段 1 的含义是"已领取"，条件正好相反，导致奖励永远领不到）
+ *  【任务模块】
+ *  - 红心改用 weapi 的 radio/like 为主通道（实测 eapi song/like 不带易盾 token 会返回
+ *    524 当前环境异常），失败再回退 eapi + 易盾 token v3
+ *  - 会员任务"已完成"判定修正为 missionStatus === 100（实测口径，50 = 未完成），
+ *    原按 2/3 判断导致复查始终显示 0
+ *  - 任务列表日志改为中文状态 + taskId + 成长值，便于人工核对
+ *  - 分享改为多通道尝试（xeapi → eapi note 路径），并对其 H5 跳转页补一次页面浏览上报
+ *  - 分享任务的跳转页上报可完成"分享单曲到站外"这类 H5 型任务
+ *  - 会员福利领取：实测 claim 端点返回 404（两个参考项目里仅有此路径且无实测记录），
+ *    改为双 host 尝试 + 404 安静跳过，不再逐条刷告警
+ *  - 移除无用的"会员任务结构（诊断）"输出（view 小节已输出完整任务列表与状态）
  * 
  * @changelog v1.5.0（新增每日任务自动化，实验性，默认关闭）
  *  - 新增 NCM_TASKS 开关：like / share / browse / welfare / view / listen，逗号分隔，默认全部不执行
@@ -573,14 +597,19 @@ async function yunbeiSign() {
     return await withRetry(() => weapiRequest('/weapi/pointmall/user/sign', {}), '云贝签到(weapi)');
 }
 
-// 云贝连签进度与抽奖（旧接口，保留兼容）
+// 云贝连签进度与阶段奖励
+// 官方路径是 pointmall/user/sign/config（旧的 /progress 已 404）；
+// lotteryConfig[].baseLotteryId > 0 才表示"可领取"，baseLotteryStatus=1 表示已领取
 async function yunbeiSignProgress() {
-    return await withRetry(() => weapiRequest('/weapi/pointmall/user/sign/progress', {}), '连签进度');
+    return await withRetry(() => weapiRequest('/weapi/pointmall/user/sign/config', {}), '连签进度');
 }
 
+// 连签阶段奖励领取（interface.music.163.com；data=true 领取成功、false 表示已领过）
 async function yunbeiSignLottery(userLotteryId) {
     return await withRetry(
-        () => weapiRequest('/weapi/pointmall/user/lottery/get', { userLotteryId: String(userLotteryId) }),
+        () => weapiRequest('/weapi/pointmall/user/sign/lottery/get', {
+            userLotteryId: String(userLotteryId),
+        }, { hostname: 'interface.music.163.com' }),
         '连签奖励领取'
     );
 }
@@ -598,10 +627,14 @@ async function yunbeiTaskFinish(task) {
     return await withRetry(() => weapiRequest('/weapi/usertool/task/point/receive', data), '云贝任务领取');
 }
 
+// 云贝余额（官方：interface.music.163.com 的 middle/mall/balance → { balance, blockBalance }）
 async function getYunbeiInfo() {
-    const res = await withRetry(() => weapiRequest('/weapi/v1/user/info', {}), '云贝余额');
+    const res = await withRetry(
+        () => weapiRequest('/weapi/middle/mall/balance', {}, { hostname: 'interface.music.163.com' }),
+        '云贝余额'
+    );
     if (res.code === 200 && res.data) return res;
-    return await withRetry(() => weapiRequest('/weapi/pointmall/user/info', {}), '云贝余额(备用)');
+    return await withRetry(() => weapiRequest('/weapi/v1/user/info', {}), '云贝余额(备用)');
 }
 
 // 黑胶乐签打卡详情（eapi，官方预检查口径）
@@ -686,12 +719,12 @@ function isAlreadySignedMsg(msg) {
     return msg.includes('重复') || msg.includes('已签到') || msg.includes('已打卡');
 }
 
-// 解析云贝余额
+// 解析云贝余额（middle/mall/balance 的 data.balance = 可用数量）
 function parseYunbeiBalance(info) {
     if (!info || info.code !== 200) return null;
     const candidates = [
-        info.data?.userPoint,
         info.data?.balance,
+        info.data?.userPoint,
         info.data?.userPoint?.balance,
         info.userPoint?.balance,
         info.userPoint,
@@ -733,29 +766,59 @@ function pickTaskSongs(songs, count) {
     };
 }
 
-// 红心歌曲（eapi · interface3，官方现行口径；返回 playlistId = 我喜欢的音乐）
+// 红心歌曲
+// 首选 weapi 的 radio/like（经典接口，不需要易盾 token）；
+// 失败时回退 eapi song/like 并携带易盾 token v3（实测不带 token 会返回 524 环境异常）
 async function likeSong(trackId) {
+    const weapiRes = await withRetry(
+        () => weapiRequest('/weapi/radio/like', {
+            alg: 'itembased',
+            trackId: String(trackId),
+            like: true,
+            time: '3',
+        }),
+        '红心(weapi)'
+    );
+    if (weapiRes.code === 200) return weapiRes;
+
+    console.log(`      ℹ️ weapi 通道 code=${weapiRes.code}${weapiRes.msg ? ' ' + weapiRes.msg : ''}，改用 eapi + 易盾 token`);
+    const token = await fetchAntiCheatTokenV3();
     return await withRetry(
         () => eapiRequest('/api/song/like', {
             trackId: String(trackId),
             like: 'true',
             time: '3',
-            checkToken: '',
+            checkToken: token || '',
         }, { hostname: 'interface3.music.163.com' }),
-        '红心歌曲'
+        '红心(eapi)'
     );
 }
 
-// 分享单曲到动态（xeapi + 易盾反作弊 token）
+// 分享单曲（多通道尝试：xeapi → eapi note 路径；实测单通道可能返回 250）
 async function shareSong(songId) {
-    return await withRetryStrict(
-        () => xeapiRequest('/api/share/friends/resource', {
-            type: 'song',
-            msg: '',
-            id: String(songId),
-        }, { checkToken: true }),
-        '分享单曲'
-    );
+    const channels = [
+        ['xeapi /api/share/friends/resource', () => xeapiRequest('/api/share/friends/resource', {
+            type: 'song', msg: '', id: String(songId),
+        }, { checkToken: true })],
+        ['eapi /api/note/share/friends/resource', async () => {
+            const token = await fetchAntiCheatTokenV3();
+            return await eapiRequest('/api/note/share/friends/resource', {
+                type: 'song', msg: '', id: String(songId), checkToken: token || '',
+            }, { hostname: 'interface3.music.163.com' });
+        }],
+    ];
+    let last = { code: -1, msg: '未尝试' };
+    for (const [label, fn] of channels) {
+        try {
+            const r = await withRetryStrict(fn, `分享(${label})`);
+            if (r.code === 200) return { ...r, channel: label };
+            last = r;
+            console.log(`      ℹ️ ${label} 返回 code=${r.code}${r.msg ? ' ' + r.msg : ''}`);
+        } catch (e) {
+            console.log(`      ℹ️ ${label} 异常：${e.message}`);
+        }
+    }
+    return last;
 }
 
 // 云贝任务列表（返回体含 taskId / userTaskId / subAction / link / completed）
@@ -867,12 +930,18 @@ async function vipWelfareList() {
     );
 }
 
-// 领取尊享福利
+// 领取尊享福利（实测 music.163.com 会 404，补一个 interface3 兜底；仍失败则视为端点失效）
 async function vipWelfareClaim(welfareId) {
-    return await withRetryStrict(
-        () => weapiRequest('/weapi/vipnewcenter/app/level/welfare/claim', { welfareId: Number(welfareId) }),
-        '福利领取'
-    );
+    let last = { code: -1, msg: '未尝试' };
+    for (const hostname of ['music.163.com', 'interface3.music.163.com']) {
+        const r = await withRetry(
+            () => weapiRequest('/weapi/vipnewcenter/app/level/welfare/claim', { welfareId: Number(welfareId) }, { hostname }),
+            `福利领取(${hostname})`
+        );
+        if (r.code === 200) return r;
+        last = r;
+    }
+    return last;
 }
 
 // 播放上报（⚠️ 刷歌行为：仅当 listen 开关显式打开时调用）
@@ -948,10 +1017,34 @@ async function runDailyTasks(userId) {
         } else {
             try {
                 const r = await shareSong(picked[0].id);
-                console.log(`      ${r.code === 200 ? '✅' : '⚠️'} 分享 [${picked[0].name}] code=${r.code}${r.msg ? ', ' + r.msg : ''}`);
+                console.log(`      ${r.code === 200 ? '✅' : '⚠️'} 分享 [${picked[0].name}] code=${r.code}${r.msg ? '：' + r.msg : ''}${r.channel ? ` (${r.channel})` : ''}`);
                 if (r.code === 200) summary.push('🔗 分享×1');
             } catch (e) {
                 console.log(`      ⚠️ 分享失败：${e.message}`);
+            }
+            // 「分享单曲到站外」的跳转页是 H5（/st/vipsharesong），补一次页面浏览上报
+            try {
+                const res = await vipMissionProgressWeapi(userId);
+                const list = Array.isArray(res?.data) ? res.data : [];
+                const task = list.find((m) => /分享/.test(m.basicMissionDTO?.name || '') && Number(m.missionStatus) !== 100);
+                if (task) {
+                    const schema = parseSchemaContent(task.basicMissionDTO?.schemaContent);
+                    const jumpUrl = schema.jumpUrl || schema['jumpUrl '] || '';
+                    const fromUrl = parseJumpUrlParams(jumpUrl);
+                    const rep = await middlePageViewReport({
+                        actionType: 'view',
+                        taskId: fromUrl.taskId || task.basicMissionDTO?.missionId || '',
+                        taskType: fromUrl.taskType || task.basicMissionDTO?.missionType || 0,
+                        viewTime: 20000,
+                        jumpUrl,
+                        taskBusiness: fromUrl.taskBusiness || '',
+                        resourceType: fromUrl.resourceType || '',
+                        pageCode: fromUrl.pageCode || '',
+                    });
+                    console.log(`      ${rep.code === 200 ? '✅' : '⚠️'} [${task.basicMissionDTO.name}] 分享页上报 code=${rep.code} data=${JSON.stringify(rep.data ?? null)}`);
+                }
+            } catch (e) {
+                console.log(`      ℹ️ 分享任务页面上报跳过：${e.message}`);
             }
         }
     }
@@ -992,28 +1085,7 @@ async function runDailyTasks(userId) {
             console.log(`      ⚠️ 浏览任务处理异常：${e.message}`);
         }
 
-        // 会员侧任务结构诊断（查看AI调音大师等属于会员成长任务，机制待确认）
-        try {
-            const vip = await vipTaskList();
-            const list = vip?.data?.taskList || vip?.taskList || [];
-            if (Array.isArray(list) && list.length) {
-                console.log('      ℹ️ 会员任务结构（诊断）：');
-                for (const t of list.slice(0, 20)) {
-                    const items = t.taskItems || [];
-                    if (!items.length) {
-                        console.log(`         · [${t.taskType ?? '-'}] ${t.taskName ?? ''} ${t.taskTag ?? ''}`);
-                        continue;
-                    }
-                    for (const it of items) {
-                        console.log(`         · ${it.taskName ?? it.taskId} 成长值+${it.growthPoint ?? 0} taskId=${it.taskId ?? '-'} tag=${it.taskTag ?? '-'}`);
-                    }
-                }
-            } else {
-                console.log(`      ℹ️ 会员任务列表返回 code=${vip.code}${vip.msg ? '：' + vip.msg : '（结构可能已变）'}`);
-            }
-        } catch (e) {
-            console.log(`      ⚠️ 会员任务诊断异常：${e.message}`);
-        }
+        // 会员侧任务结构的完整输出由 view 开关负责（见下方 5) 小节）
     }
 
     // 4) 免费领福利（会员尊享福利，paid 项自动跳过）
@@ -1032,23 +1104,26 @@ async function runDailyTasks(userId) {
             } else {
                 console.log(`      ℹ️ 共 ${items.length} 项福利`);
                 let claimed = 0;
+                let unavailable = 0;
                 for (const it of items) {
                     const paid = Number(it.specialPrice || 0) > 0;
                     const received = Number(it.userReceiveStatus) === 1;
                     console.log(`         · [Lv.${it.level ?? '-'}] ${it.showName ?? it.id} id=${it.id} 状态=${it.status ?? '-'} 已领=${received}${paid ? ' 付费' : ''}`);
                     if (paid) continue;
                     if (received) continue;
-                    try {
-                        const r = await vipWelfareClaim(it.id);
-                        if (r.code === 200) {
-                            claimed++;
-                            console.log(`         ✅ 领取成功：${it.showName ?? it.id}`);
-                        } else {
-                            console.log(`         ⚠️ 领取失败 code=${r.code}${r.msg ? ', ' + r.msg : ''}`);
-                        }
-                    } catch (e) {
-                        console.log(`         ⚠️ 领取异常：${e.message}`);
+                    const r = await vipWelfareClaim(it.id);
+                    if (r.code === 200) {
+                        claimed++;
+                        console.log(`         ✅ 领取成功：${it.showName ?? it.id}`);
+                    } else if (r.code === 404) {
+                        // 该端点已失效（两个项目里仅有此路径且无实测记录），安静跳过
+                        unavailable++;
+                    } else {
+                        console.log(`         ⚠️ 领取失败 code=${r.code}${r.msg ? '：' + r.msg : ''}`);
                     }
+                }
+                if (unavailable > 0 && claimed === 0) {
+                    console.log(`      ℹ️ 有 ${unavailable} 项待领取，但领取端点返回 404（接口已失效），已跳过`);
                 }
                 if (claimed > 0) summary.push(`🎁 福利×${claimed}`);
             }
@@ -1073,15 +1148,22 @@ async function runDailyTasks(userId) {
                 console.log('      ⚠️ 会员任务列表为空，无法定位查看类任务');
             } else {
                 const targets = [];
+                let completedCount = 0;
                 for (const m of missions) {
                     const dto = m.basicMissionDTO || {};
                     const schema = parseSchemaContent(dto.schemaContent);
                     const jumpUrl = schema.jumpUrl || schema['jumpUrl '] || '';
                     const name = dto.name || '';
-                    console.log(`         · ${name} missionCode=${dto.missionCode ?? '-'} 状态=${m.missionStatus ?? '-'} jumpUrl=${jumpUrl ? String(jumpUrl).slice(0, 60) + '…' : '-'}`);
-                    if (!/查看|浏览|体验|逛逛/.test(name)) continue;
-                    targets.push({ name, dto, schema, jumpUrl });
+                    const status = Number(m.missionStatus);
+                    // 实测口径：100 = 已完成，50 = 未完成
+                    const doneText = status === 100 ? '已完成' : status === 50 ? '未完成' : `状态${status}`;
+                    if (status === 100) completedCount++;
+                    console.log(`         · [${doneText}] ${name} missionCode=${dto.missionCode ?? '-'} taskId=${dto.missionId ?? '-'} 成长值+${dto.alue ?? '-'}`);
+                    if (status === 100) continue;
+                    // 查看/浏览类 → 页面浏览上报；分享类的页面上报由 share 开关触发（见下）
+                    if (/查看|浏览|体验|逛逛/.test(name)) targets.push({ name, dto, schema, jumpUrl });
                 }
+                console.log(`      ℹ️ 会员任务：已完成 ${completedCount}/${missions.length} 项`);
                 if (!targets.length) {
                     console.log('      ℹ️ 没有匹配到查看类任务（名称需含 查看/浏览/体验/逛逛）');
                 }
@@ -1107,11 +1189,15 @@ async function runDailyTasks(userId) {
                         console.log(`      ⚠️ [${t.name}] 上报失败：${e.message}`);
                     }
                 }
-                // 复查
+                // 复查（实测口径：missionStatus 100 = 已完成）
                 const after = await vipMissionProgressWeapi(userId);
                 const afterList = Array.isArray(after?.data) ? after.data : [];
-                const doneCount = afterList.filter((m) => Number(m.missionStatus) === 2 || Number(m.missionStatus) === 3).length;
-                console.log(`      ℹ️ 复查：会员任务已完成 ${doneCount}/${afterList.length} 项（missionStatus 2/3 视作已完成，仅供参考）`);
+                const doneCount = afterList.filter((m) => Number(m.missionStatus) === 100).length;
+                console.log(`      ℹ️ 复查：会员任务已完成 ${doneCount}/${afterList.length} 项`);
+                if (doneCount > completedCount) {
+                    console.log(`      ✅ 较上报前新增完成 ${doneCount - completedCount} 项`);
+                    summary.push(`👀 查看任务+${doneCount - completedCount}`);
+                }
             }
         } catch (e) {
             console.log(`      ⚠️ 查看类任务处理异常：${e.message}`);
@@ -1141,7 +1227,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.5.0)');
+    console.log('🎵 网易云音乐自动签到 (v1.5.1)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
@@ -1184,73 +1270,89 @@ async function main() {
     }
 
     // 3. 云贝签到（先查后签）
+    // 官方语义（ncmctl api/weapi/yunbei.go）：
+    //   /weapi/point/today/get     → data.shells = 今天签到已获得的云贝数
+    //   /weapi/pointmall/user/sign → data.sign = true 签到成功 / false 重复签到
     console.log('\n☁️ 云贝签到...');
-    let yunbeiSigned = false;
     try {
         const checkRes = await yunbeiCheckToday();
-        if (checkRes.code === 200 && checkRes.data === true) {
-            yunbeiSigned = true;
-        } else if (checkRes.code === 200 && checkRes.data && typeof checkRes.data === 'object') {
+        const shells = Number(checkRes?.data?.shells ?? 0);
+        let yunbeiSigned = shells > 0;
+        if (!yunbeiSigned && checkRes.code === 200 && checkRes.data && typeof checkRes.data === 'object') {
             const d = checkRes.data;
-            if (d.isSign === true || d.sign === true || d.signed === true || d.status === 1) yunbeiSigned = true;
-            if (d.isSign === false || d.sign === false || d.signed === false) yunbeiSigned = false;
+            if (d.isSign === true || d.sign === true || d.signed === true) yunbeiSigned = true;
         }
 
         if (yunbeiSigned) {
-            console.log('   ℹ️ 云贝今日已签到');
+            console.log(`   ℹ️ 云贝今日已签到（今日已得 ${shells} 云贝）`);
             message += '☁️ 云贝：今日已签到\n';
         } else {
             const yunbei = await yunbeiSign();
             const msg = yunbei.msg || yunbei.message || '';
-            const alreadySigned = yunbei.code === -2 || isAlreadySignedMsg(msg) ||
-                yunbei.data === false ||
-                (yunbei.code === 200 && (yunbei.data?.code === -2 || isAlreadySignedMsg(yunbei.data?.msg)));
+            const d = yunbei.data;
 
-            if (yunbei.code === 200 && !alreadySigned) {
-                let point = 0;
-                if (typeof yunbei.point === 'number') point = yunbei.point;
-                else if (typeof yunbei.data === 'number') point = yunbei.data;
-                else if (typeof yunbei.data?.point === 'number') point = yunbei.data.point;
-                else if (typeof yunbei.data?.signPoint === 'number') point = yunbei.data.signPoint;
-
-                if (point > 0) {
-                    console.log(`   ✅ 云贝签到成功！获得 ${point} 云贝`);
-                    message += `✅ 云贝签到成功 (+${point}云贝)\n`;
+            if (yunbei.code === 200 && d && typeof d === 'object' && 'sign' in d) {
+                // 官方口径：sign=true 签到成功，false 重复签到
+                const got = Number(d.yunbeiNum ?? d.point ?? 0);
+                if (d.sign === true) {
+                    console.log(`   ✅ 云贝签到成功！${got > 0 ? `获得 ${got} 云贝` : ''}`);
+                    message += `✅ 云贝签到成功${got > 0 ? ` (+${got}云贝)` : ''}\n`;
                 } else {
-                    console.log('   ✅ 云贝签到接口返回成功' + (yunbei.data ? ` (${JSON.stringify(yunbei.data).substring(0, 80)})` : ''));
-                    message += '✅ 云贝签到成功\n';
+                    console.log(`   ℹ️ 云贝今日已签到（重复签到）`);
+                    message += '☁️ 云贝：今日已签到\n';
                 }
-            } else if (alreadySigned) {
-                console.log('   ℹ️ 云贝今日已签到');
-                message += '☁️ 云贝：今日已签到\n';
             } else {
-                console.log(`   ⚠️ 云贝签到反馈：${msg || `接口返回异常 (code=${yunbei.code})`}`);
+                const alreadySigned = yunbei.code === -2 || isAlreadySignedMsg(msg) ||
+                    d === false ||
+                    (yunbei.code === 200 && (d?.code === -2 || isAlreadySignedMsg(d?.msg)));
+                if (alreadySigned) {
+                    console.log('   ℹ️ 云贝今日已签到');
+                    message += '☁️ 云贝：今日已签到\n';
+                } else if (yunbei.code === 200) {
+                    console.log(`   ✅ 云贝签到成功${d ? `（${JSON.stringify(d).substring(0, 80)}）` : ''}`);
+                    message += '✅ 云贝签到成功\n';
+                } else {
+                    console.log(`   ⚠️ 云贝签到反馈：${msg || `接口返回异常 (code=${yunbei.code})`}`);
+                }
             }
         }
     } catch (e) {
         console.log(`   ⚠️ 云贝签到执行异常: ${e.message}`);
     }
 
-    // 3.1 云贝连签进度奖励
+    // 3.1 云贝连签阶段奖励（baseLotteryId > 0 才表示可领取）
     console.log('\n📅 云贝连签进度奖励...');
     try {
         const progress = await yunbeiSignProgress();
-        if (progress.code === 200 && progress.data?.lotteryConfig) {
+        const configs = progress?.data?.lotteryConfig;
+        if (progress.code === 200 && Array.isArray(configs) && configs.length) {
             let rewardCount = 0;
-            for (const config of progress.data.lotteryConfig) {
-                const lotteryId = config.userLotteryId || config.baseLotteryId;
-                if (lotteryId && (config.baseLotteryStatus === 1 || config.status === 1)) {
-                    const lottery = await yunbeiSignLottery(lotteryId);
+            for (const config of configs) {
+                const dayText = config.signDay ? `连续签到 ${config.signDay} 天` : '连签';
+                const grantName = config.baseGrant?.name || '';
+                const jobs = [
+                    ['阶段奖励', Number(config.baseLotteryId || 0)],
+                    ['额外抽奖', Number(config.extraLotteryId || 0)],
+                ];
+                for (const [kind, id] of jobs) {
+                    if (!id) continue;
+                    const lottery = await yunbeiSignLottery(id);
                     if (lottery.code === 200) {
-                        console.log(`   ✅ 连续签到${config.signDay || ''}天奖励领取成功`);
-                        rewardCount++;
+                        if (lottery.data === true) {
+                            rewardCount++;
+                            console.log(`   ✅ ${dayText}${grantName ? `「${grantName}」` : ''} ${kind}领取成功`);
+                        } else {
+                            console.log(`   ℹ️ ${dayText}${grantName ? `「${grantName}」` : ''} ${kind}已领取过`);
+                        }
+                    } else {
+                        console.log(`   ⚠️ ${dayText} ${kind}领取失败 code=${lottery.code}${lottery.msg ? ', ' + lottery.msg : ''}`);
                     }
                 }
             }
             if (rewardCount > 0) message += `✅ 云贝连签奖励×${rewardCount}\n`;
             else console.log('   ℹ️ 暂无连签阶段奖励可领');
         } else {
-            console.log(`   ℹ️ 连签进度接口返回 ${progress.code}${progress.msg ? '：' + progress.msg : ''}（可能已下线，不影响主流程）`);
+            console.log(`   ℹ️ 连签进度接口返回 code=${progress.code}${progress.msg ? '：' + progress.msg : '（无 lotteryConfig）'}`);
         }
     } catch (e) {
         console.log(`   ⚠️ 连签奖励执行异常: ${e.message}`);
