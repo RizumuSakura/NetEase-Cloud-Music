@@ -2,8 +2,21 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.4
+ * @version 1.6.5
  * @license MIT
+ * 
+ * @changelog v1.6.5（按 H5 页面的真实路径改为明文上报，并新增分享页面上报）
+ *  - 【关键】中台页面上报改用**明文 api 路径**（与 H5 页面完全一致）：
+ *      POST interface.music.163.com/api/middle/page/view/report，form 编码 data=<JSON字符串>
+ *    之前用的是 weapi 路径（照抄 ncmctl 的 /weapi/middle/page/view/report），
+ *    虽然同样返回 200，但很可能没有被计入任务完成；H5 页面的 Dr() 是直接打明文 api 的，
+ *    本版改为与页面完全相同的一条路（weapi 保留为备用）
+ *  - 新增分享页面上报 POST /api/middle/page/share/report
+ *      { actionType:"share", time, taskId, taskType, taskBusiness, jumpUrl, channel, songId }
+ *    依据分享页 JS（236.cb8093f6.js 模块 74268）的原始实现
+ *  - 两个上报端点的路径与编码格式均已用真实端点探测确认：
+ *    form 编码 data=<JSON字符串> → {"code":200,...}；JSON body 或平铺字段 → HTTP 400；
+ *    不存在的路径 → {"code":404,"message":"接口未找到！"}
  * 
  * @changelog v1.6.4（补齐 H5 任务页的初始化调用）
  *  - 新增 /api/batch 明文请求（interface.music.163.com/api/*，H5 页面走的就是这条路，
@@ -1074,13 +1087,15 @@ function parseJumpUrlParams(jumpUrl) {
     return out;
 }
 
-// 中台页面浏览上报（模拟 App 内 webview；UA 用抓包实测的 Android webview UA）
-// 关键：actionType 必须是 "viewEnd"
-//   依据：H5 页面 JS 反查（music.163.com/st/vip/sound-effect-detail 的 490.a8d99ea6.js）——
-//   整个 bundle 只用了 viewEnd 这一个 actionType，形如：
-//     Dr("/api/middle/page/view/report", { method:"POST", data:{ data:{
-//        actionType:"viewEnd", time:Date.now(), activityPlatformId:..., ...组件props, viewTime:1e3*n }})
-//   其中 viewTime = 1000 × n（毫秒），n 即 jumpUrl 里的 view_time 秒数
+// 中台页面浏览上报
+// 【主通道】明文 api 路径 —— 与 H5 页面完全一致（H5 的 Dr() 直接发到 interface.music.163.com/api/*）
+//   实测探测：POST /api/middle/page/view/report，form 编码 data=<JSON字符串>
+//   → {"code":200,"data":false}（未登录时 data 为 false，说明端点与格式都正确）
+//   JSON body 或平铺字段 → HTTP 400；不存在的路径 → {"code":404,"message":"接口未找到！"}
+// actionType 必须是 "viewEnd"
+//   依据：H5 JS 490.a8d99ea6.js（整个 bundle 只用这一个 actionType）：
+//     Dr("/api/middle/page/view/report", {data:{data:{actionType:"viewEnd", time:Date.now(),
+//        activityPlatformId:..., ...props, viewTime:1e3*n}}})
 async function middlePageViewReport(fields) {
     const data = {
         actionType: 'viewEnd',
@@ -1094,13 +1109,58 @@ async function middlePageViewReport(fields) {
         pageCode: fields.pageCode || '',
     };
     if (fields.activityPlatformId) data.activityPlatformId = fields.activityPlatformId;
+
+    // 主通道：明文 api（与 H5 一致）
+    try {
+        const plain = await withRetryStrict(
+            () => apiPlainRequest('/api/middle/page/view/report', { data: JSON.stringify(data) }),
+            '页面浏览上报(api)'
+        );
+        if (plain.code === 200) return plain;
+        console.log(`      ℹ️ 明路上报 code=${plain.code}，回退 weapi 通道`);
+    } catch (e) {
+        console.log(`      ℹ️ 明路上报异常，回退 weapi 通道：${e.message}`);
+    }
+
+    // 备用通道：weapi（ncmctl VipMiddlePageViewReport 用的路径）
     return await withRetryStrict(
         () => weapiRequest('/weapi/middle/page/view/report', { data: JSON.stringify(data) }, {
             hostname: 'interface.music.163.com',
             ua: WEBVIEW_UA,
         }),
-        '页面浏览上报'
+        '页面浏览上报(weapi)'
     );
+}
+
+// 中台页面分享上报（分享类任务的完成口径）
+// 依据：分享页 JS 236.cb8093f6.js 模块 74268：
+//   i.default("//"+host+"/api/middle/page/share/report",
+//      { method:"post", data:{ data: Object.assign({actionType:"share", time:Date.now()}, params) } })
+async function middlePageShareReport(fields) {
+    const data = {
+        actionType: 'share',
+        time: Date.now(),
+        taskId: String(fields.taskId || ''),
+        taskType: Number(fields.taskType) || 0,
+        jumpUrl: fields.jumpUrl || '',
+        taskBusiness: fields.taskBusiness || '',
+        channel: fields.channel || 'cloudmusic',
+        songId: String(fields.songId || ''),
+    };
+    if (fields.activityPlatformId) data.activityPlatformId = fields.activityPlatformId;
+
+    try {
+        const plain = await withRetryStrict(
+            () => apiPlainRequest('/api/middle/page/share/report', { data: JSON.stringify(data) }),
+            '分享页面上报(api)'
+        );
+        if (plain.code === 200) return plain;
+        console.log(`      ℹ️ 明文分享上报 code=${plain.code}`);
+        return plain;
+    } catch (e) {
+        console.log(`      ⚠️ 明文分享上报异常：${e.message}`);
+        return { code: -1, message: e.message };
+    }
 }
 
 // 明文 api 请求（interface.music.163.com/api/*）
@@ -1333,7 +1393,7 @@ async function runDailyTasks(userId) {
                 }
             }
             if (shared) summary.push('🔗 分享×1');
-            // 「分享单曲到站外」的跳转页是 H5（/st/vipsharesong），补一次页面浏览上报
+            // 分享任务的 H5 页面上报（actionType=share）—— 依据分享页 JS 的真实完成口径
             try {
                 const res = await vipMissionProgressWeapi(userId);
                 const list = Array.isArray(res?.data) ? res.data : [];
@@ -1342,20 +1402,26 @@ async function runDailyTasks(userId) {
                     const schema = parseSchemaContent(task.basicMissionDTO?.schemaContent);
                     const jumpUrl = schema.jumpUrl || schema['jumpUrl '] || '';
                     const fromUrl = parseJumpUrlParams(jumpUrl);
-                    const rep = await middlePageViewReport({
-                        actionType: 'view',
+                    console.log(`      ℹ️ [${task.basicMissionDTO.name}] taskId=${fromUrl.taskId || task.basicMissionDTO?.missionId} taskType=${fromUrl.taskType || task.basicMissionDTO?.missionType}`);
+                    // 先打开分享页（模拟 webview 打开）
+                    if (jumpUrl) {
+                        const page = await openH5Page(jumpUrl);
+                        console.log(`      ℹ️ [${task.basicMissionDTO.name}] 打开分享页 HTTP ${page?.status ?? '-'}（${page?.data ? page.data.length : 0} 字节）`);
+                    }
+                    const rep = await middlePageShareReport({
                         taskId: fromUrl.taskId || task.basicMissionDTO?.missionId || '',
                         taskType: fromUrl.taskType || task.basicMissionDTO?.missionType || 0,
-                        viewTime: 20000,
-                        jumpUrl,
                         taskBusiness: fromUrl.taskBusiness || '',
-                        resourceType: fromUrl.resourceType || '',
-                        pageCode: fromUrl.pageCode || '',
+                        jumpUrl,
+                        channel: 'cloudmusic',
+                        songId: picked[0].id,
                     });
                     console.log(`      ${rep.code === 200 ? '✅' : '⚠️'} [${task.basicMissionDTO.name}] 分享页上报 code=${rep.code} data=${JSON.stringify(rep.data ?? null)}`);
+                } else {
+                    console.log('      ℹ️ 未找到待完成的分享类会员任务');
                 }
             } catch (e) {
-                console.log(`      ℹ️ 分享任务页面上报跳过：${e.message}`);
+                console.log(`      ℹ️ 分享页上报跳过：${e.message}`);
             }
         }
     }
@@ -1583,7 +1649,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.4)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.5)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
