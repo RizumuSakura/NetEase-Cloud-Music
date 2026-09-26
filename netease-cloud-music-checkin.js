@@ -2,8 +2,17 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.0
+ * @version 1.6.1
  * @license MIT
+ * 
+ * @changelog v1.6.1（依据 ProxyPin 抓包实测）
+ *  - openH5Page 补全为真实 App webview 请求特征：
+ *    · UA 换成实测的 Android webview UA（PLC110 / Android 16 / Chrome 138 /
+ *      CloudMusic 0.1.2 NeteaseMusic 9.3.0）
+ *    · 新增 X-Requested-With: com.netease.cloudmusic、Accept-Language、Sec-Fetch-* 等头
+ *    · Cookie 补全 NMTID / brand / osver / versioncode / sDeviceId / mobilename /
+ *      resolution / packageType 等字段（实测 App 请求携带）
+ *  - 中台页面上报统一使用同一个 webview UA（原来使用 iPhone UA，现改为本机实测的 Android UA）
  * 
  * @changelog v1.6.0
  *  - 新增「自动取消红心」：为完成任务而点的红心会被记录到状态文件，
@@ -854,7 +863,11 @@ async function getVipMissionStatusMap(userId) {
     return { map, list, code: res.code };
 }
 
-// 打开 H5 页面（模拟 webview 访问，带 Cookie）——部分"查看类"任务需要先有页面访问
+// App 内 webview 的真实 UA（2026-09-26 ProxyPin 抓包实测）
+const WEBVIEW_UA = 'Mozilla/5.0 (Linux; Android 16; PLC110 Build/BP2A.250605.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/138.0.7204.179 Mobile Safari/537.36 CloudMusic/0.1.2 NeteaseMusic/9.3.0';
+
+// 打开 H5 页面（模拟 App 内 webview 访问）
+// 抓包实测的必要条件：webview UA + X-Requested-With: com.netease.cloudmusic + 完整 Cookie
 async function openH5Page(url) {
     if (!url || typeof url !== 'string') return { status: -1, message: '无链接' };
     let u;
@@ -869,10 +882,30 @@ async function openH5Page(url) {
         path: u.pathname + u.search,
         method: 'GET',
         headers: {
-            'Cookie': buildCookie({ os: 'pc', appver: '3.1.17.204416' }),
+            'Cookie': buildCookie({
+                os: 'android',
+                osver: '16',
+                appver: '9.3.0',
+                versioncode: '9003000',
+                brand: 'OnePlus',
+                channel: 'netease',
+                packageType: 'release',
+                mobilename: 'PLC110',
+                resolution: '2659x1272',
+                buildver: String(Date.now()).substr(0, 10),
+                sDeviceId: deviceId,
+                NMTID: '00O' + crypto.randomBytes(19).toString('hex'),
+            }),
             'User-Agent': WEBVIEW_UA,
+            'X-Requested-With': 'com.netease.cloudmusic',
             'Referer': 'https://music.163.com/',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
         },
         timeout: 15000,
     });
@@ -995,9 +1028,7 @@ function parseJumpUrlParams(jumpUrl) {
     return out;
 }
 
-// 中台页面浏览上报（模拟 App 内 webview，用 iPhone webview UA）
-const WEBVIEW_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 CloudMusic/0.1.1 NeteaseMusic/9.4.95';
-
+// 中台页面浏览上报（模拟 App 内 webview；UA 用抓包实测的 Android webview UA）
 async function middlePageViewReport(fields) {
     const data = {
         actionType: fields.actionType || 'view',
@@ -1397,7 +1428,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.0)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.1)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
