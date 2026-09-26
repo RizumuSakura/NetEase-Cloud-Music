@@ -2,8 +2,21 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.3
+ * @version 1.6.4
  * @license MIT
+ * 
+ * @changelog v1.6.4（补齐 H5 任务页的初始化调用）
+ *  - 新增 /api/batch 明文请求（interface.music.163.com/api/*，H5 页面走的就是这条路，
+ *    不加 weapi 封装；已用真实端点验证：GET /api/batch 返回按路径分组的结果，
+ *    不存在的路径返回 {"code":404,"message":"接口未找到！"}）
+ *  - 查看类任务改为完整复刻 H5 流程：
+ *      ① GET 打开 jumpUrl（webview 头）
+ *      ② POST /api/batch 初始化，内含
+ *         /api/middle/vip/mission/user/progress/tms-list
+ *         { missionIdList, bizCode, missionTypeList, currentStageFinishedToNextStage, activityPlatformId }
+ *      ③ 真实停留 view_time 秒（≤25s，可用 NCM_NO_DELAY=1 跳过）
+ *      ④ POST /api/middle/page/view/report（actionType=viewEnd）
+ *    之前只做了 ①④，缺少页面初始化，服务端不认为页面被打开过
  * 
  * @changelog v1.6.3（反查 H5 页面 JS，找到查看任务的真正口径）
  *  - 【关键】页面浏览上报的 actionType 修正为 "viewEnd"
@@ -1090,6 +1103,49 @@ async function middlePageViewReport(fields) {
     );
 }
 
+// 明文 api 请求（interface.music.163.com/api/*）
+// H5 任务页走的就是这条路：JS 里的 Dr() 直接把请求发到 interface.music.163.com，不做加密封装
+async function apiPlainRequest(path, data) {
+    const body = new URLSearchParams(data).toString();
+    const result = await rawRequest({
+        hostname: 'interface.music.163.com',
+        path,
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': buildCookie({ os: 'android', appver: '9.3.0', versioncode: '9003000' }),
+            'User-Agent': WEBVIEW_UA,
+            'X-Requested-With': 'com.netease.cloudmusic',
+            'Referer': 'https://music.163.com/',
+            'Origin': 'https://music.163.com',
+        },
+        body,
+    });
+    return parseJsonResponse(result, 'api');
+}
+
+// H5 任务页的初始化批量请求（页面打开时必调，缺失会导致后续"浏览完成"上报不被认可）
+// 依据 H5 JS（490.a8d99ea6.js）：
+//   Dr("/api/batch", { method:"POST", data: {
+//     "/api/nuser/account/get": "",
+//     "/api/middle/vip/mission/user/progress/tms-list": JSON.stringify({
+//        missionIdList, bizCode, missionTypeList, currentStageFinishedToNextStage:true, activityPlatformId })}})
+async function vipMissionPageInit(taskId, taskType, taskBusiness, activityPlatformId) {
+    const tmsParams = {
+        missionIdList: String(taskId || ''),
+        bizCode: taskBusiness || '',
+        missionTypeList: String(taskType || ''),
+        currentStageFinishedToNextStage: true,
+    };
+    if (activityPlatformId) tmsParams.activityPlatformId = activityPlatformId;
+    return await withRetryStrict(
+        () => apiPlainRequest('/api/batch', {
+            '/api/nuser/account/get': '',
+            '/api/middle/vip/mission/user/progress/tms-list': JSON.stringify(tmsParams),
+        }),
+        '任务页初始化'
+    );
+}
+
 // 尊享福利列表
 async function vipWelfareList() {
     return await withRetry(
@@ -1445,12 +1501,25 @@ async function runDailyTasks(userId) {
                         console.log(`      ℹ️ [${t.name}] missionDTO 全文：${JSON.stringify(t.dto)}`);
                         console.log(`      ℹ️ [${t.name}] schemaContent 全文：${JSON.stringify(t.schema)}`);
                     }
-                    // 真实流程是「打开 H5 页面 → 停留 view_time 秒 → 页面自己上报」，
-                    // 所以这里先 GET 打开页面，再发上报
+                    // 真实流程是「打开 H5 页面 → 页面初始化(/api/batch) → 停留 view_time 秒 → 页面上报」
+                    // 所以这里依次模拟：GET 页面 → batch 初始化 → 等待 → viewEnd 上报
                     if (fields.jumpUrl) {
                         const page = await openH5Page(fields.jumpUrl);
                         const bodyLen = page?.data ? page.data.length : 0;
                         console.log(`      ℹ️ [${t.name}] 打开跳转页 HTTP ${page?.status ?? '-'}（${bodyLen} 字节）${page?.message ? ' ' + page.message : ''}`);
+                    }
+                    try {
+                        const init = await vipMissionPageInit(fields.taskId, fields.taskType, fields.taskBusiness, fields.activityPlatformId);
+                        const sub = init?.['/api/middle/vip/mission/user/progress/tms-list'];
+                        console.log(`      ℹ️ [${t.name}] 页面初始化 batch code=${init?.code}，tms-list=${sub ? JSON.stringify(sub).slice(0, 140) : '(无)'}`);
+                    } catch (e) {
+                        console.log(`      ⚠️ [${t.name}] 页面初始化失败：${e.message}`);
+                    }
+                    // 按 H5 逻辑真实等待（页面是倒计时结束后才上报的）
+                    const waitSec = Math.min((fields.viewTime || 20000) / 1000, 25);
+                    if (waitSec > 0 && !NO_DELAY) {
+                        console.log(`      ℹ️ [${t.name}] 停留 ${waitSec} 秒后上报`);
+                        await delay(waitSec * 1000);
                     }
                     try {
                         const r = await middlePageViewReport(fields);
@@ -1514,7 +1583,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.3)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.4)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
