@@ -2,8 +2,15 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.1
+ * @version 1.6.2
  * @license MIT
+ * 
+ * @changelog v1.6.2（找到分享任务的正确接口）
+ *  - 新增分享触发上报作为**主通道**：POST interface3 /xeapi/music/song/share/trigger
+ *    { songId, channel }（依据 ncmctl api/eapi/daily_song_share.go:640），
+ *    依次尝试 channel = cloudmusic / wechat / qq；失败才回退原来的分享到动态接口
+ *  - 原来的 /api/share/friends/resource 与 /api/note/share/friends/resource 实测均返回
+ *    code=250，降级为备用通道
  * 
  * @changelog v1.6.1（依据 ProxyPin 抓包实测）
  *  - openH5Page 补全为真实 App webview 请求特征：
@@ -911,7 +918,21 @@ async function openH5Page(url) {
     });
 }
 
-// 分享单曲（多通道尝试：xeapi → eapi note 路径；实测单通道可能返回 250）
+// 分享触发上报（分享类任务的真正完成口径）
+// 依据 ncmctl api/eapi/daily_song_share.go:640
+//   POST interface3 /xeapi/music/song/share/trigger  { songId, channel }
+//   channel 默认 "cloudmusic"，其他渠道如 wechat / qq / weibo
+async function shareTrigger(songId, channel = 'cloudmusic') {
+    return await withRetryStrict(
+        () => xeapiRequest('/api/music/song/share/trigger', {
+            songId: String(songId),
+            channel,
+        }, { checkToken: true }),
+        `分享触发(${channel})`
+    );
+}
+
+// 分享单曲（备用通道：xeapi → eapi note 路径；实测单通道可能返回 250）
 async function shareSong(songId) {
     const channels = [
         ['xeapi /api/share/friends/resource', () => xeapiRequest('/api/share/friends/resource', {
@@ -1201,13 +1222,32 @@ async function runDailyTasks(userId) {
         if (!picked.length) {
             console.log('      ⚠️ 没有可用歌曲，跳过');
         } else {
-            try {
-                const r = await shareSong(picked[0].id);
-                console.log(`      ${r.code === 200 ? '✅' : '⚠️'} 分享 [${picked[0].name}] code=${r.code}${r.msg ? '：' + r.msg : ''}${r.channel ? ` (${r.channel})` : ''}`);
-                if (r.code === 200) summary.push('🔗 分享×1');
-            } catch (e) {
-                console.log(`      ⚠️ 分享失败：${e.message}`);
+            let shared = false;
+            // 主通道：分享触发上报（官方"分享完成"口径）
+            for (const channel of ['cloudmusic', 'wechat', 'qq']) {
+                try {
+                    const r = await shareTrigger(picked[0].id, channel);
+                    if (r.code === 200) {
+                        shared = true;
+                        console.log(`      ✅ 分享触发成功 channel=${channel} data=${JSON.stringify(r.data ?? null)}`);
+                        break;
+                    }
+                    console.log(`      ℹ️ 分享触发 channel=${channel} 返回 code=${r.code}${r.msg ? '：' + r.msg : ''}`);
+                } catch (e) {
+                    console.log(`      ℹ️ 分享触发 channel=${channel} 异常：${e.message}`);
+                }
             }
+            // 备用通道：分享到动态
+            if (!shared) {
+                try {
+                    const r = await shareSong(picked[0].id);
+                    console.log(`      ${r.code === 200 ? '✅' : '⚠️'} 分享(备用) [${picked[0].name}] code=${r.code}${r.msg ? '：' + r.msg : ''}${r.channel ? ` (${r.channel})` : ''}`);
+                    if (r.code === 200) shared = true;
+                } catch (e) {
+                    console.log(`      ⚠️ 分享(备用)失败：${e.message}`);
+                }
+            }
+            if (shared) summary.push('🔗 分享×1');
             // 「分享单曲到站外」的跳转页是 H5（/st/vipsharesong），补一次页面浏览上报
             try {
                 const res = await vipMissionProgressWeapi(userId);
@@ -1428,7 +1468,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.1)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.2)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
