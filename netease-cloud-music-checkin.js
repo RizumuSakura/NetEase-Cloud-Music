@@ -2,8 +2,15 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.5.1
+ * @version 1.5.2
  * @license MIT
+ * 
+ * @changelog v1.5.2（追加诊断输出，用于定位剩余三个未解决问题）
+ *  - 新增云贝收支记录查询（/store/api/point/receipt），核对任务奖励是否真的到账
+ *    （实测余额显示 0，与"领取成功 +700云贝"矛盾，需要流水佐证）
+ *  - 查看类任务上报时输出 missionDTO 与 schemaContent 的**完整内容**（原来截断 300 字符），
+ *    以便从真实数据里找到 taskBusiness / pageCode / actionType 的正确取值
+ *  - 云贝任务列表补充 link 与 extInfoMap 输出（定位"分享歌曲"任务该走哪个页面）
  * 
  * @changelog v1.5.1（首次真机实测后修正，含任务模块）
  *  【云贝链路】
@@ -618,6 +625,14 @@ async function yunbeiTaskTodo() {
     return await withRetry(() => weapiRequest('/weapi/usertool/task/todo/query', {}), '云贝任务列表');
 }
 
+// 云贝收支记录（核对任务奖励是否真的到账；路径为 /store/api/point/receipt）
+async function getYunbeiReceipt(limit = 5) {
+    return await withRetry(
+        () => weapiRequest('/store/api/point/receipt', { limit, offset: 0 }),
+        '云贝收支记录'
+    );
+}
+
 async function yunbeiTaskFinish(task) {
     const data = {
         userTaskId: String(task.userTaskId || task.taskId || ''),
@@ -1061,6 +1076,8 @@ async function runDailyTasks(userId) {
                 console.log(`      ℹ️ 云贝任务共 ${items.length} 个：`);
                 for (const t of items) {
                     console.log(`         · ${t.taskName} +${t.taskPoint} taskId=${t.taskId} subAction=${t.subAction ?? '-'} 已完成=${t.completed === true}`);
+                    if (t.link) console.log(`           link=${t.link}`);
+                    if (t.extInfoMap) console.log(`           extInfoMap=${JSON.stringify(t.extInfoMap)}`);
                 }
                 const targets = items.filter((t) => t.completed !== true && /浏览|查看|逛|体验/.test(t.taskName || ''));
                 if (!targets.length) {
@@ -1181,7 +1198,8 @@ async function runDailyTasks(userId) {
                         activityPlatformId: fromUrl.activityPlatformId,
                     };
                     console.log(`      ℹ️ [${t.name}] 上报参数：${JSON.stringify({ ...fields, jumpUrl: fields.jumpUrl ? '(略)' : '' })}`);
-                    console.log(`      ℹ️ [${t.name}] schemaContent 原文：${JSON.stringify(t.schema).slice(0, 300)}`);
+                    console.log(`      ℹ️ [${t.name}] missionDTO 全文：${JSON.stringify(t.dto)}`);
+                    console.log(`      ℹ️ [${t.name}] schemaContent 全文：${JSON.stringify(t.schema)}`);
                     try {
                         const r = await middlePageViewReport(fields);
                         console.log(`      ${r.code === 200 ? '✅' : '⚠️'} [${t.name}] 上报 code=${r.code} data=${JSON.stringify(r.data ?? null)}${r.msg ? ' msg=' + r.msg : ''}`);
@@ -1227,7 +1245,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.5.1)');
+    console.log('🎵 网易云音乐自动签到 (v1.5.2)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
@@ -1405,6 +1423,31 @@ async function main() {
         }
     } catch (e) {
         console.log(`   ⚠️ 云贝余额查询异常: ${e.message}`);
+    }
+
+    // 3.4 云贝收支记录（核对任务奖励是否真的到账）
+    try {
+        const rec = await getYunbeiReceipt(5);
+        const list = Array.isArray(rec?.data) ? rec.data
+            : Array.isArray(rec?.data?.list) ? rec.data.list
+            : Array.isArray(rec?.data?.records) ? rec.data.records : [];
+        if (list.length) {
+            console.log('   📜 最近云贝收支：');
+            for (const r of list.slice(0, 5)) {
+                const point = r.point ?? r.pointAdd ?? r.pointNum ?? r.amount ?? '?';
+                const desc = [r.fixed, r.variable].filter(Boolean).join('') || r.typeName || r.description || '';
+                const time = r.time || r.createTime;
+                const timeText = time ? new Date(Number(time)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '';
+                console.log(`      · +${point} ${desc} ${timeText}`);
+                console.log(`        ${JSON.stringify(r).slice(0, 200)}`);
+            }
+        } else if (rec.code === 200) {
+            console.log('   ℹ️ 云贝收支记录为空');
+        } else {
+            console.log(`   ℹ️ 云贝收支记录返回 code=${rec.code}${rec.msg ? '：' + rec.msg : ''}`);
+        }
+    } catch (e) {
+        console.log(`   ⚠️ 云贝收支记录异常: ${e.message}`);
     }
 
     // 4. 黑胶乐签打卡（官方 eapi 预检查 + weapi 执行）
