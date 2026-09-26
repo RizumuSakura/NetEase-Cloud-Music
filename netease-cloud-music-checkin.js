@@ -2,8 +2,20 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.2
+ * @version 1.6.3
  * @license MIT
+ * 
+ * @changelog v1.6.3（反查 H5 页面 JS，找到查看任务的真正口径）
+ *  - 【关键】页面浏览上报的 actionType 修正为 "viewEnd"
+ *    依据：直接抓取 H5 页面（music.163.com/st/vip/sound-effect-detail）的 JS bundle
+ *    490.a8d99ea6.js —— 整个 bundle 只用了一个 actionType 值，即 viewEnd：
+ *      Dr("/api/middle/page/view/report", {data:{data:{
+ *         actionType:"viewEnd", time:Date.now(), activityPlatformId:..., ...props, viewTime:1e3*n }}})
+ *    原来用任务 DTO 里的 actionType（vip_growth_view_activity_page）属于发错动作类型，
+ *    服务端返回 200 但不会计入任务完成
+ *  - 由此确认 viewTime 单位为毫秒（JS 里为 1e3 * n），默认值取 H5 组件的 20 秒
+ *  - 新增会员任务"基线 → 收尾"对比：运行开始时先记录一次已完成数量，
+ *    结束时再查一次，并列出本次新完成的任务名（明确区分"本次动作生效"与"本来就已完成"）
  * 
  * @changelog v1.6.2（找到分享任务的正确接口）
  *  - 新增分享触发上报作为**主通道**：POST interface3 /xeapi/music/song/share/trigger
@@ -1050,13 +1062,19 @@ function parseJumpUrlParams(jumpUrl) {
 }
 
 // 中台页面浏览上报（模拟 App 内 webview；UA 用抓包实测的 Android webview UA）
+// 关键：actionType 必须是 "viewEnd"
+//   依据：H5 页面 JS 反查（music.163.com/st/vip/sound-effect-detail 的 490.a8d99ea6.js）——
+//   整个 bundle 只用了 viewEnd 这一个 actionType，形如：
+//     Dr("/api/middle/page/view/report", { method:"POST", data:{ data:{
+//        actionType:"viewEnd", time:Date.now(), activityPlatformId:..., ...组件props, viewTime:1e3*n }})
+//   其中 viewTime = 1000 × n（毫秒），n 即 jumpUrl 里的 view_time 秒数
 async function middlePageViewReport(fields) {
     const data = {
-        actionType: fields.actionType || 'view',
+        actionType: 'viewEnd',
         time: Date.now(),
         taskId: String(fields.taskId || ''),
         taskType: Number(fields.taskType) || 0,
-        viewTime: Number(fields.viewTime) || 15000,
+        viewTime: Number(fields.viewTime) || 20000,
         jumpUrl: fields.jumpUrl || '',
         taskBusiness: fields.taskBusiness || '',
         resourceType: fields.resourceType || '',
@@ -1136,18 +1154,31 @@ async function runDailyTasks(userId) {
         console.log(`   ℹ️ 其中 VIP 单曲 ${vipCount} 首${useVip ? '' : `（不足 3 首，回退使用普通歌曲）`}`);
     }
 
+    // 会员任务状态基线（只查一次，供 like / view 复用，并能明确区分"本次动作完成"与"本来就已完成"）
+    let baselineMap = {};
+    let baselineDone = 0;
+    let baselineTotal = 0;
+    try {
+        const st = await getVipMissionStatusMap(userId);
+        baselineMap = st.map;
+        baselineTotal = st.list.length;
+        baselineDone = st.list.filter((m) => Number(m.missionStatus) === 100).length;
+        console.log(`   ℹ️ 会员任务基线：已完成 ${baselineDone}/${baselineTotal} 项`);
+    } catch (e) {
+        console.log(`   ⚠️ 读取会员任务基线失败：${e.message}`);
+    }
+
     // 1) 红心 3 首 VIP 单曲
     // 为了完成任务而点的红心，会在任务被服务端标记为完成后自动取消（只取消脚本自己点的）
     if (taskEnabled('like')) {
         console.log('   ❤️ 红心歌曲...');
         const pending = Array.isArray(state.pendingUnlike) ? state.pendingUnlike : [];
 
-        // 查询会员任务状态，判断"红心N首会员单曲"是否已完成
+        // 用基线判断"红心N首会员单曲"是否已完成
         let likeTaskDone = false;
         let likeTaskName = '';
-        try {
-            const st = await getVipMissionStatusMap(userId);
-            for (const [name, status] of Object.entries(st.map)) {
+        {
+            for (const [name, status] of Object.entries(baselineMap)) {
                 if (/红心/.test(name)) {
                     likeTaskName = name;
                     likeTaskDone = status === 100;
@@ -1157,10 +1188,8 @@ async function runDailyTasks(userId) {
             if (likeTaskName) {
                 console.log(`      ℹ️ 任务「${likeTaskName}」状态：${likeTaskDone ? '已完成' : '未完成'}`);
             } else {
-                console.log(`      ℹ️ 未找到红心类任务（code=${st.code}），按未完成处理`);
+                console.log('      ℹ️ 未找到红心类任务，按未完成处理');
             }
-        } catch (e) {
-            console.log(`      ⚠️ 查询任务状态失败：${e.message}`);
         }
 
         // 1a) 任务已完成 → 取消之前为完成任务而点的红心
@@ -1398,12 +1427,12 @@ async function runDailyTasks(userId) {
                 for (const t of targets) {
                     const fromUrl = parseJumpUrlParams(t.jumpUrl);
                     const fields = {
-                        // 实测：动作类型来自任务的 actionType 字段（如 vip_growth_view_activity_page）
-                        actionType: t.dto.actionType || 'vip_growth_view_activity_page',
+                        // actionType 固定为 viewEnd（middlePageViewReport 内部处理），
+                        // 任务 DTO 里的 actionType（如 vip_growth_view_activity_page）仅用于日志
                         taskId: fromUrl.taskId || t.dto.missionId || '',
                         taskType: fromUrl.taskType || t.dto.missionType || 0,
-                        // view_time=15 是秒，上报字段按毫秒传
-                        viewTime: fromUrl.viewTimeSec ? fromUrl.viewTimeSec * 1000 : 15000,
+                        // view_time=15 是秒，上报字段按毫秒传（H5 JS: viewTime = 1e3 * n）
+                        viewTime: fromUrl.viewTimeSec ? fromUrl.viewTimeSec * 1000 : 20000,
                         jumpUrl: t.jumpUrl,
                         taskBusiness: fromUrl.taskBusiness || '',
                         resourceType: fromUrl.resourceType || '',
@@ -1434,11 +1463,7 @@ async function runDailyTasks(userId) {
                 const after = await vipMissionProgressWeapi(userId);
                 const afterList = Array.isArray(after?.data) ? after.data : [];
                 const doneCount = afterList.filter((m) => Number(m.missionStatus) === 100).length;
-                console.log(`      ℹ️ 复查：会员任务已完成 ${doneCount}/${afterList.length} 项`);
-                if (doneCount > completedCount) {
-                    console.log(`      ✅ 较上报前新增完成 ${doneCount - completedCount} 项`);
-                    summary.push(`👀 查看任务+${doneCount - completedCount}`);
-                }
+                console.log(`      ℹ️ 复查：会员任务已完成 ${doneCount}/${afterList.length} 项（本次运行开始时为 ${baselineDone}）`);
             }
         } catch (e) {
             console.log(`      ⚠️ 查看类任务处理异常：${e.message}`);
@@ -1462,13 +1487,34 @@ async function runDailyTasks(userId) {
         }
     }
 
+    // 收尾对比：本次运行让多少个会员任务真正完成了（这才是动作有没有生效的铁证）
+    if (baselineTotal) {
+        try {
+            const end = await getVipMissionStatusMap(userId);
+            const doneNow = end.list.filter((m) => Number(m.missionStatus) === 100).length;
+            console.log(`   ℹ️ 收尾对比：会员任务已完成 ${baselineDone} → ${doneNow}（共 ${end.list.length} 项）`);
+            if (doneNow > baselineDone) {
+                const newly = end.list
+                    .filter((m) => Number(m.missionStatus) === 100 && baselineMap[m.basicMissionDTO?.name] !== 100)
+                    .map((m) => m.basicMissionDTO?.name)
+                    .filter(Boolean);
+                console.log(`   ✅ 本次运行新完成：${newly.join('、')}`);
+                summary.push(`✅ 新完成 ${doneNow - baselineDone} 项`);
+            } else {
+                console.log('   ℹ️ 本次运行未新增完成项（可能服务端统计有延迟，或动作未被计入）');
+            }
+        } catch (e) {
+            console.log(`   ⚠️ 收尾对比失败：${e.message}`);
+        }
+    }
+
     return summary.length ? `\n🧩 每日任务：${summary.join(' / ')}\n` : '';
 }
 
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.2)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.3)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
