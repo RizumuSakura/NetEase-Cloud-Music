@@ -2,8 +2,29 @@
  * 网易云音乐自动签到脚本（完善版）
  * 
  * @description 支持青龙面板的全自动签到脚本（云贝 + 黑胶乐签 + VIP 成长任务，先查后签）
- * @version 1.6.6
+ * @version 1.6.7
  * @license MIT
+ * 
+ * @changelog v1.6.7（修复三处长期存在的实际缺陷，均经实测验证）
+ *  - 【关键修复】重试机制从未生效：withRetry 只 catch 异常，但整个请求层的失败
+ *    全部以「正常 resolve 一个 {code:-1} 对象」返回，从不抛异常（见 rawRequest 的
+ *    error/timeout、parseJsonResponse、xeapiRequest），导致 28 个调用点在真实网络
+ *    抖动时一次都不重试——v1.4.0 写入 changelog 的「所有请求增加重试（2 次）」
+ *    是一句从未兑现的承诺。现新增 isRetryableFailure() 同时判定失败返回值，
+ *    只重试网络层故障（网络错误/超时/解析失败/5xx/DNS），不重试业务错误
+ *    （如 code=301 需换凭证，重试无意义）。实测：真实请求发起次数 1 → 3。
+ *  - 【修复】pendingUnlike 账本被整体覆盖：原 `state.pendingUnlike = newlyLiked`
+ *    会冲掉此前未取消的记录，使早先为完成任务点的红心永久残留（服务端迟迟不把
+ *    任务标记完成时必然发生）。现改为按 id 去重合并（mergePendingUnlike），
+ *    并新增 ts 时间戳 + 3 天超期规则（prunePendingUnlike）：超期条目停止追踪并
+ *    打印清单，账本规模有上界；超期项不强行取消收藏，以保「任务没完成就不取消」
+ *    这条安全保证优先。旧格式 {id,name} 自动迁移，不误判为超期。
+ *  - 【修复】状态文件重置：原 .netease-checkin-state.json 里是测试值
+ *    （deviceId=testdevice...、publicKey.version=testv1、sk=serversk），
+ *    在 3 天 TTL 内会被当作有效公钥使用，导致 xeapi 通道全部失败后回退 weapi。
+ *    已重置为空状态，下次运行会重新协商真实 deviceId 与公钥。
+ *  - TUTORIAL 对齐：补上重试日志与新超期规则说明；修正 view 复查的口径描述
+ *    （missionStatus === 100，不再是已废弃的 2/3 估算）；版本号统一为 v1.6.7。
  * 
  * @changelog v1.6.6（按实测结论收敛，不再误导）
  *  - 加入实测结论标注：
@@ -190,6 +211,11 @@ const taskEnabled = (name) => TASK_SWITCH.includes(name);
 // 任务模块调试输出（完整 missionDTO / schemaContent）：NCM_TASKS_DEBUG=1
 const TASKS_DEBUG = process.env.NCM_TASKS_DEBUG === '1';
 
+// 为完成任务而点的红心，最长等待多久（默认 3 天）。
+// 超期仍未等到任务标记完成，就把它记为"遗留红心"并停止追踪，
+// 避免账本无限增长；是否解除收藏交由你在 App 里定夺。
+const PENDING_UNLIKE_TTL = 3 * 24 * 3600 * 1000;
+
 // ================= 状态文件（deviceId / xeapi 公钥持久化） =================
 
 const STATE_FILE = path.join(__dirname, '.netease-checkin-state.json');
@@ -211,6 +237,48 @@ function saveState() {
     } catch (e) {
         console.log('⚠️ 状态文件保存失败（不影响本次运行）:', e.message);
     }
+}
+
+// ===== 待取消红心账本（pendingUnlike）=====
+// 结构：[{ id, name, ts }]，ts 为该红心被点下的时间戳。
+// 迁移：v1.6.6 及以前只存 { id, name }，补一个 ts 避免被误判为超期。
+{
+    const rawPending = Array.isArray(state.pendingUnlike) ? state.pendingUnlike : [];
+    const migrated = rawPending
+        .map((item) => (item && typeof item === 'object' && item.id != null
+            ? { id: item.id, name: item.name || String(item.id), ts: Number(item.ts) || Date.now() }
+            : null))
+        .filter(Boolean);
+    state.pendingUnlike = migrated;
+    if (migrated.length !== rawPending.length) saveState();
+}
+
+// 取出仍值得追踪的条目，并把超期 / 已取消的去重后落盘。
+// 返回：kept 需要继续追踪的；expired 超期遗留的（停止追踪，只告警）。
+function prunePendingUnlike(now) {
+    const list = Array.isArray(state.pendingUnlike) ? state.pendingUnlike : [];
+    const kept = [];
+    const expired = [];
+    const seen = new Set();
+    for (const item of list) {
+        if (!item || item.id == null) continue;
+        const key = String(item.id);
+        if (seen.has(key)) continue;          // 去重，避免同曲反复入账
+        seen.add(key);
+        (now - Number(item.ts || 0) > PENDING_UNLIKE_TTL ? expired : kept).push(item);
+    }
+    state.pendingUnlike = kept;
+    saveState();
+    return { kept, expired };
+}
+
+// 合并新点的红心（按 id 去重，不覆盖既有账本）
+function mergePendingUnlike(current, added) {
+    const byId = new Map();
+    for (const item of [...(current || []), ...(added || [])]) {
+        if (item && item.id != null) byId.set(String(item.id), item);
+    }
+    return [...byId.values()];
 }
 
 // deviceId：优先环境变量，其次持久化状态，最后生成并保存（固定复用，对抗风控）
@@ -514,20 +582,42 @@ function delay(ms) {
     return new Promise((r) => setTimeout(r, ms));
 }
 
+// 判断一次请求结果是否属于"值得重试"的失败。
+// 【关键】请求层的失败全部以「正常 resolve 一个 {code:-1} 对象」的形式返回，
+// 从不抛异常（见 rawRequest 的 error/timeout 处理、parseJsonResponse、xeapiRequest）。
+// 所以只 catch 异常是不够的——那会让这里 28 个 withRetry 调用点在真实网络故障时
+// 一次都不重试（v1.4.0~v1.6.6 一直如此）。必须同时判定失败返回值。
+// 只重试网络层/解析层故障（message 带明确标识），不重试业务错误（如 code=301 需换凭证）。
+function isRetryableFailure(res) {
+    if (!res || res.code !== -1) return false;
+    const msg = String(res.message || '');
+    return /网络错误|请求超时|响应解析失败|HTTP\s*-?\d+|socket|ECONN|ETIMEDOUT|EAI_AGAIN/i.test(msg);
+}
+
 async function withRetry(fn, label = '', retries = 2) {
+    let last = { code: -1, message: `${label} 未执行` };
     for (let i = 0; i <= retries; i++) {
         try {
             if (!NO_DELAY) await delay(250 + Math.floor(Math.random() * 650));
-            return await fn();
+            const res = await fn();
+            if (!isRetryableFailure(res)) return res;   // 成功，或不可重试的业务错误
+            last = res;
+            if (i < retries) {
+                console.log(`   ⏳ ${label} 失败(${res.message || '网络错误'})，重试第 ${i + 1}/${retries} 次`);
+                await delay(800 * (i + 1));
+                continue;
+            }
+            console.log(`   ⚠️ ${label} 重试 ${retries} 次后仍失败: ${res.message || '网络错误'}`);
         } catch (e) {
+            last = { code: -1, message: e.message };
             if (i < retries) {
                 await delay(800 * (i + 1));
                 continue;
             }
             console.log(`   ⚠️ ${label} 失败: ${e.message}`);
-            return { code: -1, message: e.message };
         }
     }
+    return last;
 }
 
 // 严格版：失败时抛出异常，供"主通道失败 → 回退备用通道"的场景使用
@@ -1302,7 +1392,16 @@ async function runDailyTasks(userId) {
     // 为了完成任务而点的红心，会在任务被服务端标记为完成后自动取消（只取消脚本自己点的）
     if (taskEnabled('like')) {
         console.log('   ❤️ 红心歌曲...');
-        const pending = Array.isArray(state.pendingUnlike) ? state.pendingUnlike : [];
+        const runTs = Date.now();
+        const { kept: pending, expired } = prunePendingUnlike(runTs);
+        const pendingBefore = pending.length + expired.length;
+        if (expired.length) {
+            console.log(`      ⏳ 有 ${expired.length} 首红心已等待超过 ${Math.round(PENDING_UNLIKE_TTL / 86400000)} 天，停止追踪：`);
+            for (const item of expired) {
+                console.log(`         · ${item.name || item.id}`);
+            }
+            console.log('         （任务始终未标记完成，脚本不再自动取消这几首；如需清理请在 App 里手动取消）');
+        }
 
         // 用基线判断"红心N首会员单曲"是否已完成
         let likeTaskDone = false;
@@ -1338,8 +1437,12 @@ async function runDailyTasks(userId) {
             state.pendingUnlike = [];
             saveState();
             if (undone) summary.push(`↩️ 取消红心×${undone}`);
-        } else if (!likeTaskDone && pending.length) {
-            console.log(`      ℹ️ 任务尚未标记完成，暂不取消（共 ${pending.length} 首待取消）`);
+        } else if (!likeTaskDone && pendingBefore) {
+            if (pending.length) {
+                console.log(`      ℹ️ 任务尚未标记完成，暂不取消（共 ${pending.length} 首待取消）`);
+            } else {
+                console.log('      ℹ️ 待取消账本已清空（原有条目全部超期，见上方提示）');
+            }
         }
 
         // 1b) 任务未完成 → 点红心
@@ -1356,7 +1459,7 @@ async function runDailyTasks(userId) {
                 if (r.code === 200) {
                     ok++;
                     if (r.playlistId) likedPlaylistId = r.playlistId;
-                    newlyLiked.push({ id: s.id, name: s.name });
+                    newlyLiked.push({ id: s.id, name: s.name, ts: runTs });
                     console.log(`      ✅ ${s.name}${s.fee === 1 ? ' (VIP)' : ''}`);
                 } else {
                     console.log(`      ⚠️ ${s.name} 失败 code=${r.code}${r.msg ? '：' + r.msg : ''}`);
@@ -1366,10 +1469,10 @@ async function runDailyTasks(userId) {
                 console.log(`      ℹ️ 我喜欢的音乐 playlistId=${likedPlaylistId}`);
             }
             if (newlyLiked.length) {
-                // 记录下来，等任务被标记完成后自动取消
-                state.pendingUnlike = newlyLiked;
+                // 合并进账本（不覆盖既有记录），等任务被标记完成后统一取消
+                state.pendingUnlike = mergePendingUnlike(pending, newlyLiked);
                 saveState();
-                console.log(`      ℹ️ 已记录 ${newlyLiked.length} 首待取消（任务完成后会自动取消红心）`);
+                console.log(`      ℹ️ 已记录 ${newlyLiked.length} 首待取消，账本共 ${state.pendingUnlike.length} 首（任务完成后会自动取消）`);
             }
             summary.push(`❤️ 红心×${ok}`);
         }
@@ -1671,7 +1774,7 @@ async function runDailyTasks(userId) {
 // ================= 主流程 =================
 
 async function main() {
-    console.log('🎵 网易云音乐自动签到 (v1.6.6)');
+    console.log('🎵 网易云音乐自动签到 (v1.6.7)');
     console.log('时间：' + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }));
     console.log('='.repeat(50));
 
